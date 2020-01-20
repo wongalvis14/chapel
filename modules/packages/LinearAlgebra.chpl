@@ -406,7 +406,7 @@ private proc _eyeDiagonal(ref A: [?Dom] ?eltType) {
 }
 
 /* Return a square identity matrix over domain ``{1..m, 1..m}`` */
-proc eye(m, type eltType=real) {
+proc eye(m: integral, type eltType=real) {
   var A: [{1..m, 1..m}] eltType;
   _eyeDiagonal(A);
   return A;
@@ -414,7 +414,7 @@ proc eye(m, type eltType=real) {
 
 
 /* Return an identity matrix over domain ``{1..m, 1..n}`` */
-proc eye(m, n, type eltType=real) {
+proc eye(m: integral, n: integral, type eltType=real) {
   var A: [{1..m, 1..n}] eltType;
   _eyeDiagonal(A);
   return A;
@@ -1580,9 +1580,9 @@ module Sparse {
     ADom.startIdx = indptr;
     const (hasZero, zeroIndex) = indices.find(0);
     if hasZero {
-      ADom.nnz = zeroIndex-1;
+      ADom._nnz = zeroIndex-1;
     } else {
-      ADom.nnz = indices.size;
+      ADom._nnz = indices.size;
     }
     ADom.nnzDom = {1..indices.size};
     ADom.idx = indices;
@@ -1610,8 +1610,8 @@ module Sparse {
   private proc matMult(A: [?Adom] ?eltType, B: [?Bdom] eltType) where (isSparseArr(A) || isSparseArr(B)) {
     // matrix-vector
     if Adom.rank == 2 && Bdom.rank == 1 {
-      if !isCSArr(A) then
-        halt("Only CSR format is supported for sparse multiplication");
+      if !isCSArr(A) then writeln ("not csarr a");
+        return _sparsematvecMult(A, B);
       return _csrmatvecMult(A, B);
     }
     // vector-matrix
@@ -1639,6 +1639,50 @@ module Sparse {
   /* Compute the dot-product */
   proc _array.dot(a) where isNumeric(a) && isCSArr(this) {
     return LinearAlgebra.dot(this, a);
+  }
+  
+  /* Sparse Matrix-vector multiplication with Distributed support */
+  private proc _sparsematvecMult(const ref A: [?Adom] ?eltType, const ref X: [?Xdom] eltType) where isSparseArr(A) {
+    var Y: [Xdom] eltType;
+    var locks$: [LocaleSpace] sync bool;
+    coforall l in Locales do on l {
+      const localDomain = A.localSubdomain();
+      var (low_i, low_j) = localDomain.low;
+      var (high_i, high_j) = localDomain.high;
+      var rowResults: [low_i..high_i] eltType = 0;
+
+      forall (i,j) in localDomain {
+          rowResults[i] += A[i,j] * X[j];
+      }
+      var numRowsPerSynch = localDomain.dim(1).size / A.domain.dist.targetLocales().shape(2);
+      var numLocsInRow = A.domain.dist.targetLocales().shape(2);
+      var myPosInRow: int;// = A.domain.dim(2).size/(A.localSubdomain().dim(2).high+1)-1; // 0-based assumed
+      var myPosInCol: int; // = A.domain.dim(1).size / (A.localSubdomain()
+      const targetLoc = A.domain.dist.targetLocales();
+      for (ind, Loc) in zip(targetLoc.domain, targetLoc) {
+        if Loc==here {
+          myPosInRow = ind(1);
+          myPosInCol = ind(2);
+        }
+      }
+      for it in 0..#numLocsInRow {
+        //calculate start offset
+        var curStart = (low_i+((myPosInRow+it)*numRowsPerSynch))%(A.localSubdomain().dim(1).size);
+        var curEnd = if (myPosInRow + it) % numLocsInRow == numLocsInRow - 1 then high_i else (curStart+numRowsPerSynch-1);
+        
+        const myId = myPosInCol * numLocsInRow + ((myPosInRow + it) % numLocsInRow);
+        locks$[myId] = true;
+        for i in curStart..curEnd {
+          Y[i] += rowResults[i];
+        }
+        locks$[myId];
+      }   
+
+      /*for i in low_i..high_i {
+          Y[i] += rowResults[i];
+      }*/
+    }
+    return Y;
   }
 
 
